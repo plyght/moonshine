@@ -33,12 +33,22 @@ pub const OptSession = struct {
     last_consumed: u64,
 };
 
+// ssh-pubkey channel-binding proof carried in Hello: the client's raw ed25519
+// public key and a signature over "moonshine-auth-v1:" ++ server_cert_fp. These
+// are fixed-size arrays (not borrowed slices) so a decoded Hello owns them and
+// stays valid after the input buffer is freed.
+pub const AuthProof = struct {
+    pubkey: [32]u8,
+    sig: [64]u8,
+};
+
 pub const Hello = struct {
     version: u16,
     capabilities: u64,
     auth_method: AuthMethod,
     resume_session: ?OptSession,
     auth_token: ?[]const u8 = null,
+    auth_proof: ?AuthProof = null,
 };
 
 pub const Welcome = struct {
@@ -190,6 +200,26 @@ fn decodeAuthToken(r: *Reader) !?[]const u8 {
     return try r.take(len);
 }
 
+fn encodeAuthProof(w: *Buf, a: std.mem.Allocator, proof: ?AuthProof) !void {
+    if (proof) |p| {
+        try w.append(a, 1);
+        try w.appendSlice(a, &p.pubkey);
+        try w.appendSlice(a, &p.sig);
+    } else {
+        try w.append(a, 0);
+    }
+}
+
+fn decodeAuthProof(r: *Reader) !?AuthProof {
+    if (r.remaining() == 0) return null;
+    const present = try r.u8_();
+    if (present == 0) return null;
+    var p: AuthProof = undefined;
+    @memcpy(&p.pubkey, try r.take(32));
+    @memcpy(&p.sig, try r.take(64));
+    return p;
+}
+
 fn encodePayload(w: *Buf, a: std.mem.Allocator, frame: Frame) !void {
     switch (frame) {
         .hello => |h| {
@@ -198,6 +228,7 @@ fn encodePayload(w: *Buf, a: std.mem.Allocator, frame: Frame) !void {
             try w.append(a, @intFromEnum(h.auth_method));
             try encodeOptSession(w, a, h.resume_session);
             try encodeAuthToken(w, a, h.auth_token);
+            try encodeAuthProof(w, a, h.auth_proof);
         },
         .welcome => |m| {
             try putInt(w, a, u16, m.version);
@@ -269,6 +300,7 @@ pub fn decode(buf: []const u8) !Frame {
             .auth_method = @enumFromInt(try pr.u8_()),
             .resume_session = try decodeOptSession(&pr),
             .auth_token = try decodeAuthToken(&pr),
+            .auth_proof = try decodeAuthProof(&pr),
         } },
         .welcome => return .{ .welcome = .{
             .version = try pr.int(u16),
@@ -402,6 +434,49 @@ test "round-trip hello with resume and auth token" {
     const got = try decode(w.items);
     try testing.expectEqual(@as(u64, 99), got.hello.resume_session.?.last_consumed);
     try testing.expectEqualSlices(u8, &token, got.hello.auth_token.?);
+}
+
+test "round-trip hello with auth proof (fixed arrays survive buffer free)" {
+    const a = testing.allocator;
+    var pubkey: [32]u8 = undefined;
+    var sig: [64]u8 = undefined;
+    for (&pubkey, 0..) |*p, i| p.* = @intCast(i);
+    for (&sig, 0..) |*p, i| p.* = @intCast(255 - i);
+    const f: Frame = .{ .hello = .{
+        .version = 0x0001,
+        .capabilities = 0,
+        .auth_method = .ssh_pubkey,
+        .resume_session = null,
+        .auth_proof = .{ .pubkey = pubkey, .sig = sig },
+    } };
+    var w: Buf = .empty;
+    try encode(&w, a, f);
+    const got = try decode(w.items);
+    // Free the encode buffer first: the proof must be owned, not borrowed.
+    w.deinit(a);
+    try testing.expect(got.hello.auth_proof != null);
+    try testing.expectEqualSlices(u8, &pubkey, &got.hello.auth_proof.?.pubkey);
+    try testing.expectEqualSlices(u8, &sig, &got.hello.auth_proof.?.sig);
+}
+
+test "round-trip hello with auth token and proof" {
+    const a = testing.allocator;
+    const token = [_]u8{0x22} ** 32;
+    const f: Frame = .{ .hello = .{
+        .version = 0x0001,
+        .capabilities = 0,
+        .auth_method = .ssh_pubkey,
+        .resume_session = null,
+        .auth_token = &token,
+        .auth_proof = .{ .pubkey = [_]u8{0xAA} ** 32, .sig = [_]u8{0xBB} ** 64 },
+    } };
+    var w: Buf = .empty;
+    defer w.deinit(a);
+    try encode(&w, a, f);
+    const got = try decode(w.items);
+    try testing.expectEqualSlices(u8, &token, got.hello.auth_token.?);
+    try testing.expect(got.hello.auth_proof != null);
+    try testing.expectEqual(@as(u8, 0xAA), got.hello.auth_proof.?.pubkey[0]);
 }
 
 test "round-trip welcome" {

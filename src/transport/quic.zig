@@ -72,6 +72,15 @@ const StreamSend = struct {
     acked: u64 = 0,
 };
 
+// A datagram held in the WAN simulator's delay queue until its release time.
+const DelayedPkt = struct {
+    data: [2048]u8,
+    len: usize,
+    addr: c.struct_sockaddr_in,
+    alen: c.socklen_t,
+    release: u64,
+};
+
 pub const Conn = struct {
     allocator: std.mem.Allocator,
     fd: c_int = -1,
@@ -94,6 +103,17 @@ pub const Conn = struct {
     _base: u64 = 0,
     sends: std.AutoHashMap(i64, StreamSend) = undefined,
     sends_init: bool = false,
+    // WAN simulator (dev/testing): when sim_delay_ns > 0, outgoing and incoming
+    // datagrams are held in delay queues to emulate propagation latency, and are
+    // dropped with probability sim_loss_permille/1000. Zero = disabled (fast path).
+    sim_delay_ns: u64 = 0,
+    sim_loss_permille: u32 = 0,
+    tx_q: std.ArrayList(DelayedPkt) = .empty,
+    rx_q: std.ArrayList(DelayedPkt) = .empty,
+    // When a Conn is minted by a Listener it shares the listener's persistent
+    // UDP socket and server TLS context, so it must not free them on deinit.
+    owns_fd: bool = true,
+    owns_ctx: bool = true,
 
     fn now(self: *Conn) c.ngtcp2_tstamp {
         _ = self;
@@ -133,6 +153,8 @@ pub const Conn = struct {
         c.ngtcp2_path_storage_zero(&ps);
         const n = c.ngtcp2_conn_write_connection_close_versioned(self.conn, &ps.path, PKT_INFO_VERSION, &pi, &buf, buf.len, &ccerr, self.now());
         if (n > 0) {
+            // A graceful close should reach the peer even under the simulator,
+            // so send it directly rather than through the delay/loss queue.
             _ = c.sendto(self.fd, &buf, @intCast(n), 0, @ptrCast(&self.remote_sa), self.remote_len);
         }
     }
@@ -148,11 +170,63 @@ pub const Conn = struct {
         return len == 32;
     }
 
+    /// Enable the WAN simulator: `rtt_ms` round-trip latency (split half on each
+    /// direction) and `loss_pct` per-datagram drop probability, each way.
+    pub fn setSim(self: *Conn, rtt_ms: u32, loss_pct: f32) void {
+        self.sim_delay_ns = @as(u64, rtt_ms) * std.time.ns_per_ms / 2;
+        const permille: i64 = @intFromFloat(loss_pct * 10.0);
+        self.sim_loss_permille = @intCast(std.math.clamp(permille, 0, 1000));
+    }
+
+    fn simActive(self: *Conn) bool {
+        return self.sim_delay_ns != 0 or self.sim_loss_permille != 0;
+    }
+
+    fn simDrop(self: *Conn) bool {
+        if (self.sim_loss_permille == 0) return false;
+        var r: [2]u8 = undefined;
+        fillRandom(&r);
+        const v: u32 = (@as(u32, r[0]) << 8 | r[1]) % 1000;
+        return v < self.sim_loss_permille;
+    }
+
+    // Send a datagram, honoring the WAN simulator when active.
+    fn emit(self: *Conn, bytes: []const u8, addr: *const c.struct_sockaddr_in, alen: c.socklen_t) void {
+        if (!self.simActive()) {
+            _ = c.sendto(self.fd, bytes.ptr, bytes.len, 0, @ptrCast(addr), alen);
+            return;
+        }
+        if (self.simDrop()) return;
+        if (bytes.len > 2048) return;
+        var pkt: DelayedPkt = .{ .data = undefined, .len = bytes.len, .addr = addr.*, .alen = alen, .release = monotonicNs() + self.sim_delay_ns };
+        @memcpy(pkt.data[0..bytes.len], bytes);
+        self.tx_q.append(self.allocator, pkt) catch return;
+    }
+
+    // Flush any tx datagrams whose delay has elapsed; return true if the rx queue
+    // still holds undelivered packets (so the caller keeps polling promptly).
+    fn serviceSim(self: *Conn) void {
+        if (!self.simActive()) return;
+        const t = monotonicNs();
+        var i: usize = 0;
+        while (i < self.tx_q.items.len) {
+            const p = self.tx_q.items[i];
+            if (p.release <= t) {
+                _ = c.sendto(self.fd, &p.data, p.len, 0, @ptrCast(&self.tx_q.items[i].addr), p.alen);
+                _ = self.tx_q.orderedRemove(i);
+            } else i += 1;
+        }
+    }
+
     /// Block up to timeout_ms for a datagram, then service the connection once
     /// (read, timers, drain writes). Pass 0 to poll without blocking.
     pub fn poll(self: *Conn, timeout_ms: c_int) Error!void {
+        // With the WAN simulator active, cap the wait so delayed packets are
+        // released on time even when the socket is otherwise idle.
+        var t = timeout_ms;
+        if (self.simActive() and (t < 0 or t > 5)) t = 5;
         var pfd: c.struct_pollfd = .{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
-        _ = c.poll(&pfd, 1, timeout_ms);
+        _ = c.poll(&pfd, 1, t);
         try self.step();
     }
 
@@ -212,14 +286,18 @@ pub const Conn = struct {
         if (self.conn) |cn| c.ngtcp2_conn_del(cn);
         if (self.ssl) |s| c.SSL_free(s);
         if (self.ossl) |o| c.ngtcp2_crypto_ossl_ctx_del(o);
-        if (self.ssl_ctx) |x| c.SSL_CTX_free(x);
-        if (self.fd >= 0) _ = c.close(self.fd);
+        if (self.owns_ctx) {
+            if (self.ssl_ctx) |x| c.SSL_CTX_free(x);
+        }
+        if (self.owns_fd and self.fd >= 0) _ = c.close(self.fd);
         self.recv_buf.deinit(self.allocator);
         if (self.sends_init) {
             var it = self.sends.iterator();
             while (it.next()) |entry| entry.value_ptr.buf.deinit(self.allocator);
             self.sends.deinit();
         }
+        self.tx_q.deinit(self.allocator);
+        self.rx_q.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -275,9 +353,11 @@ pub const Conn = struct {
     }
 
     pub fn step(self: *Conn) Error!void {
+        self.serviceSim();
         try self.readAll();
         try self.handleTimer();
         try self.drainWrite();
+        self.serviceSim();
     }
 
     fn readAll(self: *Conn) Error!void {
@@ -294,30 +374,54 @@ pub const Conn = struct {
             if (n == 0) break;
             const pkt = buf[0..@intCast(n)];
 
-            if (self.is_server and self.conn == null) {
-                self.serverAccept(pkt, &src, slen) catch return Error.AcceptFailed;
-            } else if (self.is_server) {
-                self.remote_sa = src;
-                self.remote_len = slen;
+            if (!self.simActive()) {
+                try self.processPacket(pkt, &src, slen);
+            } else if (!self.simDrop() and pkt.len <= 2048) {
+                var p: DelayedPkt = .{ .data = undefined, .len = pkt.len, .addr = src, .alen = slen, .release = monotonicNs() + self.sim_delay_ns };
+                @memcpy(p.data[0..pkt.len], pkt);
+                self.rx_q.append(self.allocator, p) catch {};
             }
-            if (self.conn == null) continue;
+        }
+        try self.drainRx();
+    }
 
-            var path: c.ngtcp2_path = .{
-                .local = .{ .addr = @ptrCast(&self.local_sa), .addrlen = self.local_len },
-                .remote = .{ .addr = @ptrCast(&src), .addrlen = slen },
-                .user_data = null,
-            };
-            var pi: c.ngtcp2_pkt_info = std.mem.zeroes(c.ngtcp2_pkt_info);
-            const rv = c.ngtcp2_conn_read_pkt_versioned(self.conn, &path, PKT_INFO_VERSION, &pi, pkt.ptr, pkt.len, self.now());
-            if (rv != 0) {
-                if (rv == c.NGTCP2_ERR_DRAINING or rv == c.NGTCP2_ERR_CLOSING) {
-                    // Peer sent CONNECTION_CLOSE (or we're draining); the session
-                    // is over — surface it so the app loop exits promptly.
-                    self.peer_closed = true;
-                    continue;
-                }
-                return Error.ReadFailed;
+    // Deliver any received datagrams whose simulated delay has elapsed.
+    fn drainRx(self: *Conn) Error!void {
+        if (self.rx_q.items.len == 0) return;
+        const t = monotonicNs();
+        var i: usize = 0;
+        while (i < self.rx_q.items.len) {
+            if (self.rx_q.items[i].release <= t) {
+                var p = self.rx_q.orderedRemove(i);
+                try self.processPacket(p.data[0..p.len], &p.addr, p.alen);
+            } else i += 1;
+        }
+    }
+
+    fn processPacket(self: *Conn, pkt: []const u8, src: *c.struct_sockaddr_in, slen: c.socklen_t) Error!void {
+        if (self.is_server and self.conn == null) {
+            self.serverAccept(pkt, src, slen) catch return Error.AcceptFailed;
+        } else if (self.is_server) {
+            self.remote_sa = src.*;
+            self.remote_len = slen;
+        }
+        if (self.conn == null) return;
+
+        var path: c.ngtcp2_path = .{
+            .local = .{ .addr = @ptrCast(&self.local_sa), .addrlen = self.local_len },
+            .remote = .{ .addr = @ptrCast(src), .addrlen = slen },
+            .user_data = null,
+        };
+        var pi: c.ngtcp2_pkt_info = std.mem.zeroes(c.ngtcp2_pkt_info);
+        const rv = c.ngtcp2_conn_read_pkt_versioned(self.conn, &path, PKT_INFO_VERSION, &pi, pkt.ptr, pkt.len, self.now());
+        if (rv != 0) {
+            if (rv == c.NGTCP2_ERR_DRAINING or rv == c.NGTCP2_ERR_CLOSING) {
+                // Peer sent CONNECTION_CLOSE (or we're draining); the session
+                // is over — surface it so the app loop exits promptly.
+                self.peer_closed = true;
+                return;
             }
+            return Error.ReadFailed;
         }
     }
 
@@ -409,7 +513,7 @@ pub const Conn = struct {
                 self.sends.getPtr(pend.?).?.sent += @intCast(pdatalen);
             }
             if (n > 0) {
-                _ = c.sendto(self.fd, &buf, @intCast(n), 0, @ptrCast(&self.remote_sa), self.remote_len);
+                self.emit(buf[0..@intCast(n)], &self.remote_sa, self.remote_len);
             }
             if (n == 0) break;
         }
@@ -720,6 +824,120 @@ pub const Server = struct {
 
         try self.setupTlsServer(cert_path, key_path);
         return self;
+    }
+};
+
+fn buildServerCtx(allocator: std.mem.Allocator, cert_path: []const u8, key_path: []const u8) Error!*c.SSL_CTX {
+    const ctx = c.SSL_CTX_new(c.TLS_method()) orelse return Error.TlsFailed;
+    errdefer c.SSL_CTX_free(ctx);
+    _ = c.SSL_CTX_set_min_proto_version(ctx, c.TLS1_3_VERSION);
+    _ = c.SSL_CTX_set_max_proto_version(ctx, c.TLS1_3_VERSION);
+
+    const cert_z = try allocator.dupeZ(u8, cert_path);
+    defer allocator.free(cert_z);
+    const key_z = try allocator.dupeZ(u8, key_path);
+    defer allocator.free(key_z);
+    if (c.SSL_CTX_use_certificate_chain_file(ctx, cert_z.ptr) != 1) return Error.TlsFailed;
+    if (c.SSL_CTX_use_PrivateKey_file(ctx, key_z.ptr, c.SSL_FILETYPE_PEM) != 1) return Error.TlsFailed;
+    c.SSL_CTX_set_alpn_select_cb(ctx, alpnSelectCb, null);
+    return ctx;
+}
+
+/// A persistent listening endpoint: it owns the UDP socket and the server TLS
+/// context, both of which outlive any individual connection. `accept` hands
+/// back a fully-handshaked server `Conn` bound to the shared socket; when that
+/// connection dies the same `Listener` accepts the next one (used for session
+/// resume, where a brand-new QUIC connection reattaches to a surviving shell).
+pub const Listener = struct {
+    allocator: std.mem.Allocator,
+    fd: c_int = -1,
+    ssl_ctx: *c.SSL_CTX,
+    local_sa: c.struct_sockaddr_in = std.mem.zeroes(c.struct_sockaddr_in),
+    local_len: c.socklen_t = @sizeOf(c.struct_sockaddr_in),
+    pending: ?*Conn = null,
+
+    pub fn init(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, cert_path: []const u8, key_path: []const u8) Error!*Listener {
+        try ensureOsslInit();
+        const self = try allocator.create(Listener);
+        errdefer allocator.destroy(self);
+
+        const ctx = try buildServerCtx(allocator, cert_path, key_path);
+        errdefer c.SSL_CTX_free(ctx);
+
+        self.* = .{ .allocator = allocator, .ssl_ctx = ctx };
+
+        self.fd = try makeUdpSocket();
+        errdefer _ = c.close(self.fd);
+
+        self.local_sa = try bindAddrV4(allocator, bind_addr, port);
+        if (c.bind(self.fd, @ptrCast(&self.local_sa), self.local_len) != 0) return Error.BindFailed;
+        if (c.getsockname(self.fd, @ptrCast(&self.local_sa), &self.local_len) != 0) return Error.GetSockNameFailed;
+        return self;
+    }
+
+    pub fn localPort(self: *Listener) u16 {
+        return std.mem.bigToNative(u16, self.local_sa.sin_port);
+    }
+
+    pub fn socketFd(self: *Listener) c_int {
+        return self.fd;
+    }
+
+    fn newPendingConn(self: *Listener) Error!*Conn {
+        const conn = try self.allocator.create(Conn);
+        errdefer self.allocator.destroy(conn);
+        conn.* = .{
+            .allocator = self.allocator,
+            .is_server = true,
+            .fd = self.fd,
+            .owns_fd = false,
+            .owns_ctx = false,
+            .ssl_ctx = self.ssl_ctx,
+            .local_sa = self.local_sa,
+            .local_len = self.local_len,
+        };
+        conn.sends = std.AutoHashMap(i64, StreamSend).init(self.allocator);
+        conn.sends_init = true;
+        conn.conn_ref.user_data = conn;
+        return conn;
+    }
+
+    /// Non-blocking: drive an in-progress accept one step. Returns a `Conn` only
+    /// once its handshake completes; otherwise null. Call whenever the socket is
+    /// readable (and periodically to service handshake timers).
+    pub fn pollAccept(self: *Listener) Error!?*Conn {
+        if (self.pending == null) self.pending = try self.newPendingConn();
+        const p = self.pending.?;
+        p.step() catch {
+            p.deinit();
+            self.pending = null;
+            return null;
+        };
+        if (p.handshakeCompleted()) {
+            self.pending = null;
+            return p;
+        }
+        if (p.peerClosed()) {
+            p.deinit();
+            self.pending = null;
+        }
+        return null;
+    }
+
+    /// Blocking: read datagrams until a client fully handshakes, then return it.
+    pub fn accept(self: *Listener) Error!*Conn {
+        while (true) {
+            var pfd: c.struct_pollfd = .{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+            _ = c.poll(&pfd, 1, 50);
+            if (try self.pollAccept()) |conn| return conn;
+        }
+    }
+
+    pub fn deinit(self: *Listener) void {
+        if (self.pending) |p| p.deinit();
+        c.SSL_CTX_free(self.ssl_ctx);
+        if (self.fd >= 0) _ = c.close(self.fd);
+        self.allocator.destroy(self);
     }
 };
 

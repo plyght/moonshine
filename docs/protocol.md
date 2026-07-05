@@ -84,7 +84,7 @@ and the resume/replay buffer to know what the peer has consumed (see `Ack`).
 
 | Value | Frame        | Payload                                                          |
 |-------|--------------|-----------------------------------------------------------------|
-| 0x01  | `Hello`      | version:u16, capabilities:u64, auth_method:u8, resume:OptSession, auth_token:OptToken |
+| 0x01  | `Hello`      | version:u16, capabilities:u64, auth_method:u8, resume:OptSession, auth_token:OptToken, auth_proof:OptProof |
 | 0x02  | `Welcome`    | version:u16, capabilities:u64, stream_map:StreamMap, session_id  |
 | 0x03  | `Reject`     | reason_code:u16, min_version:u16, max_version:u16                |
 | 0x10  | `Resize`     | cols:u16, rows:u16, xpix:u16, ypix:u16                           |
@@ -96,6 +96,9 @@ and the resume/replay buffer to know what the peer has consumed (see `Ack`).
 `StreamMap` := term_in:u64, term_out:u64 (QUIC stream IDs).
 `OptSession` := present:u8; if 1 → session_id:[16]u8, last_consumed:u64.
 `OptToken` := present:u8; if 1 → len:u16, bytes:[len]u8 (bootstrap auth token, 32 bytes).
+`OptProof` := present:u8; if 1 → pubkey:[32]u8, sig:[64]u8 (ssh-pubkey channel-binding proof).
+The fixed-size `pubkey`/`sig` fields are copied out of the wire buffer on decode (owned, not
+borrowed), so a decoded `Hello` remains valid after its input buffer is freed.
 `session_id` in `Welcome` := [16]u8 (opaque server-issued resume token).
 
 ### Bootstrap-over-ssh (auth_method 0x00)
@@ -125,6 +128,34 @@ rides TLS 1.3 (raw public keys / cert) or an out-of-band bootstrap token.
 | 0x01  | `ssh_pubkey`         | RFC 7250 raw ed25519 key vs `~/.ssh/authorized_keys`        |
 | 0x02  | `daemon_cert`        | Standalone daemon X.509 identity                            |
 | 0x03  | `underlay_trust`     | Trusted underlay (Tailscale/WireGuard); still TLS-encrypted |
+
+### ssh-pubkey via TLS channel binding (auth_method 0x01)
+
+`mshd --listen --require-key [authorized_keys]` requires the client to prove possession of an
+ed25519 key listed in `authorized_keys`. Rather than a challenge round trip, the proof is bound
+to the TLS session: after the QUIC/TLS handshake the client signs
+
+```
+"moonshine-auth-v1:" ++ <server cert SHA-256 fingerprint, 32B>
+```
+
+with its `~/.ssh/id_ed25519` (or `--identity <path>`) key and rides the 32B pubkey + 64B
+signature in `Hello.auth_proof`. Both sides know the fingerprint (client via the observed peer
+cert, server via `fingerprintFromPemFile` of its own cert), so the signature is bound to that
+exact session and cannot be replayed against a different server or connection. The server accepts
+iff the pubkey is in `authorized_keys` (constant-time membership) AND the signature verifies;
+otherwise it sends `Reject{auth_failed}` and closes. Only unencrypted OpenSSH private keys are
+supported for `--identity`; encrypted keys are refused (use the bootstrap-over-ssh path, which
+handles agent/passphrase auth via ssh itself).
+
+### Standalone daemon cert + TOFU (auth_method 0x02)
+
+`mshd --listen` without `--cert/--key` uses a persistent self-signed ed25519 cert generated once
+under `~/.config/moonshine/daemon_{cert,key}.pem` (dir created 0700), so its fingerprint is
+stable across restarts. On `msh --connect`, the client pins the server fingerprint in
+`~/.config/moonshine/known_hosts` (`<host> <hex-sha256>`) on first use, and on subsequent
+connects refuses loudly (ssh-style `WARNING: REMOTE HOST IDENTITY HAS CHANGED`, exit 2) if it
+changes. TOFU is skipped when a stronger bootstrap fingerprint already pins the cert.
 
 ## 7. Resume / roaming
 

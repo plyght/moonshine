@@ -117,6 +117,47 @@ pub fn generateEphemeral(allocator: std.mem.Allocator) Error!Ephemeral {
     };
 }
 
+/// Generate a self-signed ed25519 cert + key and write them to the given paths
+/// (persistently — not unlinked). Returns the cert's SHA-256 DER fingerprint.
+/// Used for the standalone daemon's stable identity.
+pub fn generatePersistent(cert_path: [:0]const u8, key_path: [:0]const u8) Error!Fingerprint {
+    const pctx = c.EVP_PKEY_CTX_new_id(c.EVP_PKEY_ED25519, null) orelse return Error.KeygenFailed;
+    defer c.EVP_PKEY_CTX_free(pctx);
+    if (c.EVP_PKEY_keygen_init(pctx) != 1) return Error.KeygenFailed;
+    var pkey: ?*c.EVP_PKEY = null;
+    if (c.EVP_PKEY_keygen(pctx, &pkey) != 1) return Error.KeygenFailed;
+    defer c.EVP_PKEY_free(pkey);
+
+    const x = c.X509_new() orelse return Error.CertFailed;
+    defer c.X509_free(x);
+    _ = c.X509_set_version(x, 2);
+    _ = c.ASN1_INTEGER_set(c.X509_get_serialNumber(x), 1);
+    _ = c.X509_gmtime_adj(c.X509_getm_notBefore(x), 0);
+    _ = c.X509_gmtime_adj(c.X509_getm_notAfter(x), 60 * 60 * 24 * 3650);
+    if (c.X509_set_pubkey(x, pkey) != 1) return Error.CertFailed;
+
+    const name = c.X509_get_subject_name(x);
+    _ = c.X509_NAME_add_entry_by_txt(name, "CN", c.MBSTRING_ASC, "moonshine", -1, -1, 0);
+    if (c.X509_set_issuer_name(x, name) != 1) return Error.CertFailed;
+    if (c.X509_sign(x, pkey, null) == 0) return Error.CertFailed;
+
+    var fp: Fingerprint = undefined;
+    var fplen: c_uint = 0;
+    if (c.X509_digest(x, c.EVP_sha256(), &fp, &fplen) != 1 or fplen != 32) return Error.DigestFailed;
+
+    {
+        const bio = c.BIO_new_file(cert_path.ptr, "w") orelse return Error.WriteFailed;
+        defer _ = c.BIO_free(bio);
+        if (c.PEM_write_bio_X509(bio, x) != 1) return Error.WriteFailed;
+    }
+    {
+        const bio = c.BIO_new_file(key_path.ptr, "w") orelse return Error.WriteFailed;
+        defer _ = c.BIO_free(bio);
+        if (c.PEM_write_bio_PrivateKey(bio, pkey, null, null, 0, null, null) != 1) return Error.WriteFailed;
+    }
+    return fp;
+}
+
 /// Load a PEM certificate from `path` and compute its SHA-256 DER fingerprint.
 pub fn fingerprintFromPemFile(path: [:0]const u8) Error!Fingerprint {
     const bio = c.BIO_new_file(path.ptr, "r") orelse return Error.LoadCertFailed;
