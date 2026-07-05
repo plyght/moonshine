@@ -426,4 +426,8 @@ fn run(init: std.process.Init.Minimal, gpa: std.mem.Allocator, verbose: cli.Verb
         conn.step() catch break;
         if (conn.peerClosed()) break;
     }
+
+    // If we're leaving first (user quit / stdin EOF), let the server know so it
+    // tears down the shell promptly instead of idling.
+    conn.closeGraceful();
 }

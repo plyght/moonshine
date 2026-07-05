@@ -121,6 +121,22 @@ pub const Conn = struct {
         return self.peer_closed;
     }
 
+    /// Send a QUIC CONNECTION_CLOSE so the peer learns the session ended
+    /// immediately instead of waiting out the idle timeout. Best-effort.
+    pub fn closeGraceful(self: *Conn) void {
+        if (self.conn == null or self.peer_closed) return;
+        var ccerr: c.ngtcp2_ccerr = undefined;
+        c.ngtcp2_ccerr_default(&ccerr);
+        var buf: [1500]u8 = undefined;
+        var pi: c.ngtcp2_pkt_info = std.mem.zeroes(c.ngtcp2_pkt_info);
+        var ps: c.ngtcp2_path_storage = undefined;
+        c.ngtcp2_path_storage_zero(&ps);
+        const n = c.ngtcp2_conn_write_connection_close_versioned(self.conn, &ps.path, PKT_INFO_VERSION, &pi, &buf, buf.len, &ccerr, self.now());
+        if (n > 0) {
+            _ = c.sendto(self.fd, &buf, @intCast(n), 0, @ptrCast(&self.remote_sa), self.remote_len);
+        }
+    }
+
     /// Fetch the peer's leaf TLS certificate and compute its SHA-256 DER
     /// fingerprint. Returns false if no peer certificate is available.
     pub fn peerFingerprint(self: *Conn, out: *[32]u8) bool {
@@ -294,7 +310,12 @@ pub const Conn = struct {
             var pi: c.ngtcp2_pkt_info = std.mem.zeroes(c.ngtcp2_pkt_info);
             const rv = c.ngtcp2_conn_read_pkt_versioned(self.conn, &path, PKT_INFO_VERSION, &pi, pkt.ptr, pkt.len, self.now());
             if (rv != 0) {
-                if (rv == c.NGTCP2_ERR_DRAINING or rv == c.NGTCP2_ERR_CLOSING) continue;
+                if (rv == c.NGTCP2_ERR_DRAINING or rv == c.NGTCP2_ERR_CLOSING) {
+                    // Peer sent CONNECTION_CLOSE (or we're draining); the session
+                    // is over — surface it so the app loop exits promptly.
+                    self.peer_closed = true;
+                    continue;
+                }
                 return Error.ReadFailed;
             }
         }

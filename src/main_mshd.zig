@@ -195,5 +195,8 @@ fn run(init: std.process.Init.Minimal, gpa: std.mem.Allocator) !void {
         if (conn.peerClosed()) break;
     }
 
+    // The shell exited (or the peer left): tell the client immediately so it
+    // doesn't wait out the idle timeout.
+    conn.closeGraceful();
     conn.step() catch {};
 }
